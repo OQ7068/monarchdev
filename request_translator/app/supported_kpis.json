@@ -2,7 +2,21 @@
     {
         "kpi_name": "slice_throughput",
         "kpi_description": "Throughput per slice",
-        "kpi_unit": "bits/sec",
-        "kpi_prom_metric_name": "slice_throughput"
+        "kpi_unit": "bits/sec"
+    },
+    {
+        "kpi_name": "slice_packet_loss_ratio",
+        "kpi_description": "Packet loss ratio per slice",
+        "kpi_unit": "ratio"
+    },
+    {
+        "kpi_name": "slice_latency_seconds",
+        "kpi_description": "Average latency per slice",
+        "kpi_unit": "seconds"
+    },
+    {
+        "kpi_name": "slice_jitter_seconds",
+        "kpi_description": "Jitter per slice",
+        "kpi_unit": "seconds"
     }
 ]

@@ -1,0 +1,25 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: open5gs1-000001-smf
+  namespace: open5gs
+  labels:
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/instance: open5gs1-000001
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: smf
+    helm.sh/chart: smf-2.2.9
+    slice: "1-000001"
+spec:
+  endpoints:
+  - port: metrics
+    scrapeProtocols:
+    - Prometheus
+  namespaceSelector:
+    matchNames:
+    - open5gs
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: metrics
+      app.kubernetes.io/instance: open5gs1-000001
+      app.kubernetes.io/name: smf

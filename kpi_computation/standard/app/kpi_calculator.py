@@ -4,8 +4,9 @@
 # version ='1.0.0'
 # ---------------------------------------------------------------------------
 """
-Prometheus exporter which exports slice throughput KPI.
+Prometheus exporter which exports slice throughput, packet loss, latency and jitter KPIs.
 For use with the 5G-MONARCH project and Open5GS.
+Latency and Jitter calculations depend on an external Blackbox Exporter.
 """
 import os
 import logging
@@ -26,6 +27,10 @@ TIME_RANGE = os.getenv("TIME_RANGE", "5s")
 
 # Prometheus variables
 SLICE_THROUGHPUT = prom.Gauge('slice_throughput', 'throughput per slice (bits/sec)', ['snssai', 'seid', 'direction'])
+SLICE_PACKET_LOSS = prom.Gauge('slice_packet_loss_ratio', 'packet loss ratio per slice', ['snssai', 'direction'])
+SLICE_LATENCY = prom.Gauge('slice_latency_seconds', 'average latency per slice', ['snssai'])
+SLICE_JITTER = prom.Gauge('slice_jitter_seconds', 'jitter per slice', ['snssai'])
+
 # get rid of bloat
 prom.REGISTRY.unregister(prom.PROCESS_COLLECTOR)
 prom.REGISTRY.unregister(prom.PLATFORM_COLLECTOR)
@@ -50,6 +55,7 @@ def query_prometheus(params, url):
     except (KeyError, IndexError, ValueError) as e:
         log.error(f"Failed to parse Prometheus response: {e}")
         log.warning("No data available!")
+    return [] # Return empty list on failure
 
 def get_slice_throughput_per_seid_and_direction(snssai, direction):
     """
@@ -81,6 +87,85 @@ def get_slice_throughput_per_seid_and_direction(snssai, direction):
 
     return throughput_per_seid
 
+def get_slice_packet_loss(snssai, direction):
+    """
+    计算每个切片的丢包率。
+    返回一个字典 {snssai: value (ratio)}
+    """
+    time_range = TIME_RANGE
+    packet_loss_per_slice = {}
+
+    direction_mapping_packets = {
+        "uplink": "ul_packets",
+        "downlink": "dl_packets"
+    }
+    direction_mapping_dropped = {
+        "uplink": "ul_packets_dropped",
+        "downlink": "dl_packets_dropped"
+    }
+
+    if direction not in direction_mapping_packets:
+        log.error("Invalid direction for packet loss")
+        return packet_loss_per_slice
+
+    # PromQL查询: (丢包速率 / 总包速率)，如果总包速率为0则结果为0
+    # 我们通过 smf function 关联，确保只计算属于该切片的流量
+    # 注意: 此处假设存在一个 upf_smf_association 指标用于关联UPF实例和SNSSAI
+    query = (
+        f'(sum(rate(fivegs_ep_n3_gtp_{direction_mapping_dropped[direction]}_total[{time_range}])) by (instance) '
+        f'and on(instance) '
+        f'sum(upf_smf_association{{snssai="{snssai}"}}) by (instance))'
+        f'/ on(instance) '
+        f'(sum(rate(fivegs_ep_n3_gtp_{direction_mapping_packets[direction]}_total[{time_range}])) by (instance) '
+        f'and on(instance) '
+        f'sum(upf_smf_association{{snssai="{snssai}"}}) by (instance))'
+    )
+    
+    log.debug(query)
+    params = {'query': query}
+    results = query_prometheus(params, MONARCH_THANOS_URL)
+
+    if results:
+        # 假设一个切片只有一个UPF，直接取第一个结果
+        value = float(results[0]["value"][1])
+        packet_loss_per_slice[snssai] = value
+
+    return packet_loss_per_slice
+
+def get_slice_latency_and_jitter(snssai):
+    """
+    从 Blackbox Exporter 获取延迟和抖动。
+    返回两个字典: {snssai: latency}, {snssai: jitter}
+    """
+    time_range = TIME_RANGE
+    latency_per_slice = {}
+    jitter_per_slice = {}
+
+    # 假设 Blackbox Exporter 暴露的指标带有 'slice_id' 标签
+    # 我们将 snssai 中的 '-' 替换为 '_' 来匹配标签格式
+    slice_label_value = snssai.replace('-', '_')
+
+    # 计算平均延迟
+    latency_query = f'avg_over_time(probe_duration_seconds{{slice_id="{slice_label_value}"}}[{time_range}])'
+    log.debug(latency_query)
+    latency_params = {'query': latency_query}
+    latency_results = query_prometheus(latency_params, MONARCH_THANOS_URL)
+
+    if latency_results:
+        value = float(latency_results[0]["value"][1])
+        latency_per_slice[snssai] = value
+
+    # 计算抖动 (延迟的标准差)
+    jitter_query = f'stddev_over_time(probe_duration_seconds{{slice_id="{slice_label_value}"}}[{time_range}])'
+    log.debug(jitter_query)
+    jitter_params = {'query': jitter_query}
+    jitter_results = query_prometheus(jitter_params, MONARCH_THANOS_URL)
+
+    if jitter_results:
+        value = float(jitter_results[0]["value"][1])
+        jitter_per_slice[snssai] = value
+        
+    return latency_per_slice, jitter_per_slice
    
 def get_active_snssais():
     """
@@ -118,6 +203,15 @@ def export_to_prometheus(snssai, seid, direction, value):
     log.info(f"SNSSAI={snssai} | SEID={seid} | DIR={direction:8s} | RATE (Mbps)={value_mbits}")
     SLICE_THROUGHPUT.labels(snssai=snssai, seid=seid, direction=direction).set(value)
 
+def export_packet_loss_to_prometheus(snssai, direction, value):
+    log.info(f"SNSSAI={snssai} | DIR={direction:8s} | PKT_LOSS_RATIO={value:.6f}")
+    SLICE_PACKET_LOSS.labels(snssai=snssai, direction=direction).set(value)
+
+def export_latency_jitter_to_prometheus(snssai, latency, jitter):
+    log.info(f"SNSSAI={snssai} | LATENCY (s)={latency:.6f} | JITTER (s)={jitter:.6f}")
+    SLICE_LATENCY.labels(snssai=snssai).set(latency)
+    SLICE_JITTER.labels(snssai=snssai).set(jitter)
+
 def run_kpi_computation():
     directions = ["uplink", "downlink"]
     active_snssais = get_active_snssais()
@@ -127,10 +221,22 @@ def run_kpi_computation():
     
     log.debug(f"Active SNSSAIs: {active_snssais}")
     for snssai in active_snssais:
+        # 计算和导出吞吐量
         for direction in directions:
             throughput_per_seid = get_slice_throughput_per_seid_and_direction(snssai, direction)
             for seid, value in throughput_per_seid.items():
                 export_to_prometheus(snssai, seid, direction, value)
+        
+        # 计算和导出丢包率
+        for direction in directions:
+            packet_loss_per_slice = get_slice_packet_loss(snssai, direction)
+            for slice_id, value in packet_loss_per_slice.items():
+                export_packet_loss_to_prometheus(slice_id, direction, value)
+
+        # 计算和导出延迟和抖动
+        latency_per_slice, jitter_per_slice = get_slice_latency_and_jitter(snssai)
+        if snssai in latency_per_slice and snssai in jitter_per_slice:
+            export_latency_jitter_to_prometheus(snssai, latency_per_slice[snssai], jitter_per_slice[snssai])
 
 
 if __name__ == "__main__":
@@ -152,8 +258,3 @@ if __name__ == "__main__":
     log.addHandler(console_handler)
         
     main()
-
-    
-    
-
-
